@@ -1,4 +1,5 @@
 import os
+import tempfile
 from typing import Any
 
 from langchain_sandbox import PyodideSandbox
@@ -17,6 +18,39 @@ from workflow.exception.errors.err_code import CodeEnum
 from workflow.extensions.otlp.trace.span import Span
 
 MAX_ERROR_MESSAGE_LENGTH = 4096
+
+
+class _FilePyodideSandbox(PyodideSandbox):
+    """Use the official CLI file input without rewriting Python escapes.
+
+    langchain-sandbox 0.0.6 only exposes inline code through execute(), and
+    @langchain/pyodide-sandbox 0.0.4 replaces literal backslash-n sequences in
+    that input. Its official -f entry point reads source verbatim instead.
+    Keep the SDK's command, process lifecycle and resource limits, adapting
+    only the input flag until the SDK exposes file input publicly.
+    """
+
+    def __init__(self, source_path: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._source_path = source_path
+
+    def _build_command(
+        self,
+        code: str,
+        *,
+        session_bytes: bytes | None = None,
+        session_metadata: dict | None = None,
+        memory_limit_mb: int | None = None,
+    ) -> list[str]:
+        command = super()._build_command(
+            code,
+            session_bytes=session_bytes,
+            session_metadata=session_metadata,
+            memory_limit_mb=memory_limit_mb,
+        )
+        code_flag_index = command.index("-c")
+        command[code_flag_index : code_flag_index + 2] = ["-f", self._source_path]
+        return command
 
 
 class LangchainExecutor(BaseExecutor):
@@ -42,26 +76,33 @@ class LangchainExecutor(BaseExecutor):
         :raises CustomException: If code execution fails
         """
         try:
-            # Keep every Deno permission disabled.  Pyodide's default
-            # node_modules read/write permissions are retained internally by the
-            # official wrapper so it can load its runtime dependencies; user
-            # Python code cannot access the workflow container's filesystem,
-            # environment, network, subprocess, or FFI.
-            sandbox = PyodideSandbox(
-                allow_env=False,
-                allow_read=False,
-                allow_write=False,
-                allow_net=False,
-                allow_run=False,
-                allow_ffi=False,
-            )
             bounded_timeout = _bounded_timeout(timeout)
             bounded_memory_limit = _bounded_memory_limit()
-            result = await sandbox.execute(
-                code,
-                timeout_seconds=bounded_timeout,
-                memory_limit_mb=bounded_memory_limit,
-            )
+            # Grant Deno read access only to this invocation's source file in
+            # addition to the SDK's existing node_modules permissions. File
+            # input preserves escapes, import discovery and top-level await.
+            # The context manager removes the file on success or failure.
+            with tempfile.TemporaryDirectory(prefix="astron-code-") as source_dir:
+                source_path = os.path.realpath(os.path.join(source_dir, "source.py"))
+                # Close the writer before Deno opens the file (also on Windows).
+                with open(
+                    source_path, "w", encoding="utf-8", newline=""
+                ) as source_file:
+                    source_file.write(code)
+                sandbox = _FilePyodideSandbox(
+                    source_path,
+                    allow_env=False,
+                    allow_read=["node_modules", source_path],
+                    allow_write=False,
+                    allow_net=False,
+                    allow_run=False,
+                    allow_ffi=False,
+                )
+                result = await sandbox.execute(
+                    code,
+                    timeout_seconds=bounded_timeout,
+                    memory_limit_mb=bounded_memory_limit,
+                )
             if result.status == "success":
                 return result.stdout if result.stdout else ""
             error_message = (result.stderr or "Code execution failed").strip()
