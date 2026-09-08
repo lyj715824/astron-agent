@@ -66,7 +66,9 @@ async def test_langchain_executor_passes_isolation_and_resource_limits(
         stderr = None
 
     class FakeSandbox:
-        def __init__(self, **kwargs: object) -> None:
+        def __init__(self, source_path: str, **kwargs: object) -> None:
+            calls["source_path"] = source_path
+            assert Path(source_path).read_text() == "print('ok')"
             calls["permissions"] = kwargs
 
         async def execute(self, _code: str, **kwargs: object) -> FakeResult:
@@ -75,7 +77,7 @@ async def test_langchain_executor_passes_isolation_and_resource_limits(
 
     monkeypatch.setenv("CODE_EXEC_MEMORY_LIMIT_MB", "9999")
     monkeypatch.setattr(
-        "workflow.engine.nodes.code.executor.langchain.langchain_executor.PyodideSandbox",
+        "workflow.engine.nodes.code.executor.langchain.langchain_executor._FilePyodideSandbox",
         FakeSandbox,
     )
 
@@ -86,7 +88,7 @@ async def test_langchain_executor_passes_isolation_and_resource_limits(
     assert result == '{"result":"ok"}'
     assert calls["permissions"] == {
         "allow_env": False,
-        "allow_read": False,
+        "allow_read": ["node_modules", calls["source_path"]],
         "allow_write": False,
         "allow_net": False,
         "allow_run": False,
@@ -108,14 +110,14 @@ async def test_langchain_executor_truncates_error_message(
         stderr = "x" * (MAX_ERROR_MESSAGE_LENGTH + 100)
 
     class FakeSandbox:
-        def __init__(self, **_kwargs: object) -> None:
+        def __init__(self, _source_path: str, **_kwargs: object) -> None:
             return None
 
         async def execute(self, _code: str, **_kwargs: object) -> FakeResult:
             return FakeResult()
 
     monkeypatch.setattr(
-        "workflow.engine.nodes.code.executor.langchain.langchain_executor.PyodideSandbox",
+        "workflow.engine.nodes.code.executor.langchain.langchain_executor._FilePyodideSandbox",
         FakeSandbox,
     )
 
@@ -137,14 +139,14 @@ async def test_langchain_executor_reports_timeout_code(
         stderr = "Execution timed out after 10 seconds"
 
     class FakeSandbox:
-        def __init__(self, **_kwargs: object) -> None:
+        def __init__(self, _source_path: str, **_kwargs: object) -> None:
             return None
 
         async def execute(self, _code: str, **_kwargs: object) -> FakeResult:
             return FakeResult()
 
     monkeypatch.setattr(
-        "workflow.engine.nodes.code.executor.langchain.langchain_executor.PyodideSandbox",
+        "workflow.engine.nodes.code.executor.langchain.langchain_executor._FilePyodideSandbox",
         FakeSandbox,
     )
 
