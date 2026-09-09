@@ -19,6 +19,19 @@ from workflow.extensions.otlp.log_trace.base import Usage
 from workflow.extensions.otlp.log_trace.node_log import NodeLog
 
 
+def _encode_legacy_trace_data(data: Any, depth: int = 0) -> Any:
+    """Preserve the depth-limited JSON representation expected by Console."""
+    if depth > 4 and not isinstance(data, str):
+        return json.dumps(data, ensure_ascii=False)
+
+    if isinstance(data, dict):
+        return {k: _encode_legacy_trace_data(v, depth + 1) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_encode_legacy_trace_data(item, depth + 1) for item in data]
+    else:
+        return data
+
+
 class Status(BaseModel):
     """
     Execution status information.
@@ -222,28 +235,12 @@ class WorkflowLog(BaseModel):
                     return uploaded_values[data]
             return data
 
-        def process_data(data: dict, depth: int = 0) -> Any:
-            """
-            Recursively process data structure to handle large strings.
-
-            :param data: Data structure to process
-            :param depth: Current depth of the data structure
-            :return: Processed data with large strings uploaded to OSS
-            """
-            if depth > 4 and not isinstance(data, str):
-                return json.dumps(data, ensure_ascii=False)
-
-            if isinstance(data, dict):
-                return {k: process_data(v, depth + 1) for k, v in data.items()}
-            elif isinstance(data, list):
-                return [process_data(item, depth + 1) for item in data]
-            else:
-                return data
-
         # input_vars/output_vars entries become JSON strings at depth five.
         # Visit their values first so the name/value wrappers stay readable by
         # Console while large values no longer bypass object-storage offload.
-        result = process_data(externalize_large_strings(self.model_dump(mode="json")))
+        result = _encode_legacy_trace_data(
+            externalize_large_strings(self.model_dump(mode="json"))
+        )
 
         def json_fallback(obj: Any) -> Any:
             """
