@@ -202,17 +202,25 @@ class WorkflowLog(BaseModel):
 
         :return: JSON string representation of the workflow log
         """
-        import sys
+        uploaded_values: dict[str, str] = {}
 
-        def is_large_string(s: str, limit: int = 5 * 1024) -> bool:
-            """
-            Check if a string exceeds the size limit for direct JSON inclusion.
-
-            :param s: String to check
-            :param limit: Size limit in bytes (default: 5KB)
-            :return: True if string exceeds limit, False otherwise
-            """
-            return isinstance(s, str) and sys.getsizeof(s.encode("utf-8")) > limit
+        def externalize_large_strings(data: Any) -> Any:
+            """Handle large values before the legacy depth-limited encoding."""
+            if isinstance(data, dict):
+                return {k: externalize_large_strings(v) for k, v in data.items()}
+            if isinstance(data, list):
+                return [externalize_large_strings(item) for item in data]
+            if isinstance(data, str):
+                encoded = data.encode("utf-8")
+                if len(encoded) > 5 * 1024:
+                    if data not in uploaded_values:
+                        uploaded_values[data] = get_oss_service().upload_file(
+                            f"{uuid.uuid4().hex}.txt",
+                            encoded,
+                            bucket_name=os.getenv("OSS_BUCKET_NAME", "test"),
+                        )
+                    return uploaded_values[data]
+            return data
 
         def process_data(data: dict, depth: int = 0) -> Any:
             """
@@ -229,19 +237,13 @@ class WorkflowLog(BaseModel):
                 return {k: process_data(v, depth + 1) for k, v in data.items()}
             elif isinstance(data, list):
                 return [process_data(item, depth + 1) for item in data]
-            elif isinstance(data, str):
-                if is_large_string(data):
-                    return get_oss_service().upload_file(
-                        f"{uuid.uuid4().hex}.txt",
-                        data.encode("utf-8"),
-                        bucket_name=os.getenv("OSS_BUCKET_NAME", "test"),
-                    )
-                else:
-                    return data
             else:
                 return data
 
-        result = process_data(self.model_dump(mode="json"))
+        # input_vars/output_vars entries become JSON strings at depth five.
+        # Visit their values first so the name/value wrappers stay readable by
+        # Console while large values no longer bypass object-storage offload.
+        result = process_data(externalize_large_strings(self.model_dump(mode="json")))
 
         def json_fallback(obj: Any) -> Any:
             """

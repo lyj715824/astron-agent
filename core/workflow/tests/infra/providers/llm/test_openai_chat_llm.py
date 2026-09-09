@@ -1,16 +1,19 @@
 """Tests for the OpenAI-compatible chat provider."""
 
 import importlib
+import json
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import pytest
 from openai.types.chat import ChatCompletionChunk
 
 from workflow.consts.engine.chat_status import SparkLLMStatus
+from workflow.engine.nodes.entities.llm_response import LLMResponse
 from workflow.engine.nodes.util.frame_processor import OpenAIFrameProcessor
 from workflow.exception.e import CustomException
 from workflow.exception.errors.err_code import CodeEnum
+from workflow.extensions.otlp.log_trace.node_log import NodeLog
 
 OPENAI_CHAT_MODULE = "workflow.infra.providers.llm.openai.openai_chat_llm"
 if getattr(sys.modules.get(OPENAI_CHAT_MODULE), "__spec__", None) is None:
@@ -39,8 +42,14 @@ class AsyncChunkStream:
 
 
 class RecordingSpan:
+    def __init__(self) -> None:
+        self.exceptions: list[Exception] = []
+
     async def add_info_events_async(self, _: dict[str, Any]) -> None:
         pass
+
+    def record_exception(self, error: Exception) -> None:
+        self.exceptions.append(error)
 
 
 def build_openai_chat_ai() -> OpenAIChatAI:
@@ -197,3 +206,142 @@ async def test_process_stream_rejects_response_without_sse_chunks() -> None:
 
     assert exc_info.value.code == CodeEnum.OPEN_AI_REQUEST_ERROR.code
     assert exc_info.value.cause_error == "LLM stream returned no data"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame_count", [3, 3000])
+@pytest.mark.parametrize("stream_end", ["stop", "break_on_stop", "eof"])
+async def test_achat_keeps_trace_small_and_preserves_stream_frames(
+    monkeypatch: pytest.MonkeyPatch, frame_count: int, stream_end: str
+) -> None:
+    chat_ai = build_openai_chat_ai()
+    node_log = NodeLog(sid="test-sid")
+    frames = [
+        LLMResponse(
+            {
+                "id": f"frame-{index}",
+                "choices": [
+                    {
+                        "delta": {
+                            "content": "response-content-" * 100,
+                            "reasoning_content": f"reasoning-{index}",
+                        },
+                        "finish_reason": (
+                            "stop"
+                            if index == frame_count - 1 and stream_end != "eof"
+                            else None
+                        ),
+                    }
+                ],
+                "usage": {"total_tokens": index + 1},
+            }
+        )
+        for index in range(frame_count)
+    ]
+    original_payloads = json.dumps([frame.msg for frame in frames])
+
+    async def recv_messages(
+        _self: OpenAIChatAI, *_args: Any, **_kwargs: Any
+    ) -> AsyncIterator[LLMResponse]:
+        for frame in frames:
+            yield frame
+
+    monkeypatch.setattr(OpenAIChatAI, "_recv_messages", recv_messages)
+
+    stream = chat_ai.achat(
+        flow_id="test-flow",
+        user_message=[{"role": "user", "content": "test question"}],
+        span=RecordingSpan(),  # type: ignore[arg-type]
+        event_log_node_trace=node_log,
+    )
+    received = []
+    try:
+        async for response in stream:
+            received.append(response)
+            if (
+                stream_end == "break_on_stop"
+                and chat_ai.decode_message(response.msg)[0] == "stop"
+            ):
+                break
+
+        assert received == frames
+        assert json.dumps([frame.msg for frame in received]) == original_payloads
+        assert len(json.dumps(node_log.logs).encode("utf-8")) < 512
+        assert len(node_log.logs) == 1
+        assert f"frame_count={frame_count}" in json.loads(node_log.logs[0])["message"]
+        assert "response-content-" not in node_log.logs[0]
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
+async def test_achat_does_not_log_success_for_abnormal_finish_reason(
+    monkeypatch: pytest.MonkeyPatch, finish_reason: str
+) -> None:
+    node_log = NodeLog(sid="test-sid")
+    frame = LLMResponse(
+        {"choices": [{"delta": {"content": ""}, "finish_reason": finish_reason}]}
+    )
+
+    async def recv_messages(
+        _self: OpenAIChatAI, *_args: Any, **_kwargs: Any
+    ) -> AsyncIterator[LLMResponse]:
+        yield frame
+
+    monkeypatch.setattr(OpenAIChatAI, "_recv_messages", recv_messages)
+    received = [
+        response
+        async for response in build_openai_chat_ai().achat(
+            flow_id="test-flow",
+            user_message=[],
+            span=RecordingSpan(),  # type: ignore[arg-type]
+            event_log_node_trace=node_log,
+        )
+    ]
+
+    assert received == [frame]
+    assert node_log.logs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("custom_error", [True, False])
+async def test_achat_preserves_errors_after_partial_stream(
+    monkeypatch: pytest.MonkeyPatch, custom_error: bool
+) -> None:
+    chat_ai = build_openai_chat_ai()
+    node_log = NodeLog(sid="test-sid")
+    span = RecordingSpan()
+    frame = LLMResponse({"choices": [{"delta": {"content": "partial"}}]})
+    error = (
+        CustomException(CodeEnum.OPEN_AI_REQUEST_ERROR, err_msg="stream failed")
+        if custom_error
+        else RuntimeError("stream failed")
+    )
+
+    async def recv_messages(
+        _self: OpenAIChatAI, *_args: Any, **_kwargs: Any
+    ) -> AsyncIterator[LLMResponse]:
+        yield frame
+        raise error
+
+    monkeypatch.setattr(OpenAIChatAI, "_recv_messages", recv_messages)
+    received = []
+    with pytest.raises(CustomException) as exc_info:
+        async for response in chat_ai.achat(
+            flow_id="test-flow",
+            user_message=[],
+            span=span,  # type: ignore[arg-type]
+            event_log_node_trace=node_log,
+        ):
+            received.append(response)
+
+    assert received == [frame]
+    assert node_log.logs == []
+    if custom_error:
+        assert exc_info.value is error
+        assert span.exceptions == []
+    else:
+        assert exc_info.value.code == CodeEnum.OPEN_AI_REQUEST_ERROR.code
+        assert exc_info.value.cause_error == "stream failed"
+        assert span.exceptions == [error]

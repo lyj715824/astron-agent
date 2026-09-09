@@ -343,15 +343,33 @@ class OpenAIChatAI(ChatAI):
                 )
 
             # Process streaming messages and yield responses
+            frame_count = 0
+            finish_reason = None
+            summary_logged = False
             async for msg in self._recv_messages(
                 url, user_message, extra_params, span, timeout
             ):
-                # Log message data if trace logger is provided
-                if event_log_node_trace:
+                frame_count += 1
+                choices = msg.msg.get("choices") or []
+                if choices:
+                    finish_reason = choices[0].get("finish_reason") or finish_reason
+                if (
+                    event_log_node_trace
+                    and not summary_logged
+                    and finish_reason == ChatStatus.FINISH_REASON.value
+                ):
+                    # Consumers stop at this frame without exhausting the generator.
                     event_log_node_trace.add_info_log(
-                        json.dumps(msg.msg, ensure_ascii=False)
+                        f"LLM stream completed: frame_count={frame_count}"
                     )
+                    summary_logged = True
                 yield msg
+
+            # Final output is recorded by the node; keep stream diagnostics bounded.
+            if event_log_node_trace and not summary_logged and not finish_reason:
+                event_log_node_trace.add_info_log(
+                    f"LLM stream completed: frame_count={frame_count}"
+                )
         except CustomException as e:
             # Re-raise custom exceptions as-is
             raise e

@@ -35,15 +35,33 @@ def kafka_report(
         workflow_log.set_status(code=code, message=message)
         workflow_log.set_end()
 
+        stage = "serialize"
+        payload_bytes = 0
         try:
             # Get Kafka topic from environment variables
             topic = os.getenv("KAFKA_TOPIC") or ""
             # Send workflow log as JSON to Kafka topic
             workflow_data = workflow_log.to_json()
-            logger.info(f"Workflow trace data: {workflow_data}")
+            payload_bytes = len(workflow_data.encode("utf-8"))
+            logger.info(
+                "Workflow trace prepared: sid={}, flow_id={}, payload_bytes={}, nodes={}",
+                workflow_log.sid,
+                workflow_log.flow_id,
+                payload_bytes,
+                len(workflow_log.trace),
+            )
+            stage = "kafka_send"
             get_kafka_producer_service().send(topic, workflow_data)
         except Exception as err:
-            logger.error("Failed to produce message: {}".format(err))
+            logger.error(
+                "Failed to produce message: sid={}, flow_id={}, stage={}, "
+                "payload_bytes={}, error={}",
+                workflow_log.sid,
+                workflow_log.flow_id,
+                stage,
+                payload_bytes,
+                err,
+            )
 
     # Create and start daemon thread for asynchronous reporting
     thread = threading.Thread(target=_report, daemon=True)
